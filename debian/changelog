@@ -1,3 +1,7 @@
+cassandra (3.0.9-rubrik-20.0) unstable; urgency=medium
+  * Modify cqlsh to block mutating queries on restricted tables
+
+ -- Praveen Sampath <praveen.sampath@rubrik.com>  Thu, 24 Oct 2019 09:30:23 +0000
 cassandra (3.0.9-rubrik-19.0) unstable; urgency=medium
   * Remove prepared statements from COPY FROM
 

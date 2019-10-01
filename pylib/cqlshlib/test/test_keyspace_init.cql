@@ -293,3 +293,13 @@ CREATE AGGREGATE aggMin(int)
     STYPE int
     INITCOND null;
 
+-- Create blobstore specific tables to test query restriction
+-- Queries that mutate data in these tables are to be prohibited
+
+CREATE TABLE sharded_chain_blob_store_group (
+  id text PRIMARY KEY
+);
+
+CREATE TABLE dc_blob_store_group (
+  id text PRIMARY KEY
+);
