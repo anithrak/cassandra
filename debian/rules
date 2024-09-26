@@ -27,7 +27,7 @@ build-stamp: patch-stamp
 	dh_testdir
 	printf "version=%s" $(VERSION) > build.properties
 
-	cd pylib && python setup.py install --no-compile --install-layout deb \
+	cd pylib && python3 setup.py install --no-compile --install-layout deb \
 		--root $(CURDIR)/debian/cassandra
 
 	touch build-stamp
@@ -37,7 +37,7 @@ install: build
 	dh_testroot
 	dh_installdirs
 	dh_install
-	dh_python2
+	dh_python3
 
 # Build architecture-independent files here.
 binary-indep: build install

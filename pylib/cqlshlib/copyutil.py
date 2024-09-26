@@ -16,7 +16,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import ConfigParser
 import csv
 import datetime
 import json
@@ -26,6 +25,7 @@ import os
 import platform
 import random
 import re
+import signal
 import struct
 import sys
 import threading
@@ -36,32 +36,33 @@ from bisect import bisect_right
 from calendar import timegm
 from collections import defaultdict, namedtuple
 from decimal import Decimal
-from Queue import Queue
 from random import randint
-from StringIO import StringIO
+from io import StringIO
 from select import select
 from uuid import UUID
-from util import profile_on, profile_off
 
+import configparser
+from queue import Queue
+
+from cassandra import OperationTimedOut
 from cassandra.cluster import Cluster, DefaultConnection
-from cassandra.cqltypes import ReversedType, UserType, DecimalType, BooleanType, FloatType, DoubleType, \
-    LongType, Int32Type, InetAddressType, TimestampType, TimeUUIDType, ShortType, TimeType, VarcharType, \
-    IntegerType, VarcharType, UUIDType
+from cassandra.cqltypes import ReversedType, UserType, VarcharType
 from cassandra.metadata import protect_name, protect_names, protect_value
 from cassandra.policies import RetryPolicy, WhiteListRoundRobinPolicy, DCAwareRoundRobinPolicy, FallthroughRetryPolicy
 from cassandra.query import BatchStatement, BatchType, SimpleStatement, tuple_factory
 from cassandra.util import Date, Time
+from cqlshlib.util import profile_on, profile_off
 
-from cql3handling import CqlRuleSet
-from displaying import NO_COLOR_MAP
-from formatting import format_value_default, DateTimeFormat, EMPTY, get_formatter
-from sslhandling import ssl_settings
+from cqlshlib.cql3handling import CqlRuleSet
+from cqlshlib.displaying import NO_COLOR_MAP
+from cqlshlib.formatting import format_value_default, CqlType, DateTimeFormat, EMPTY, get_formatter, BlobType
+from cqlshlib.sslhandling import ssl_settings
 
 PROFILE_ON = False
 STRACE_ON = False
 DEBUG = False  # This may be set to True when initializing the task
+# TODO: review this for MacOS, maybe use in ('Linux', 'Darwin')
 IS_LINUX = platform.system() == 'Linux'
-IS_WINDOWS = platform.system() == 'Windows'
 
 CopyOptions = namedtuple('CopyOptions', 'copy dialect unrecognized')
 
@@ -79,8 +80,8 @@ def printdebugmsg(msg):
         printmsg(msg)
 
 
-def printmsg(msg, eol='\n', encoding='utf8'):
-    sys.stdout.write(msg.encode(encoding))
+def printmsg(msg, eol='\n'):
+    sys.stdout.write(msg)
     sys.stdout.write(eol)
     sys.stdout.flush()
 
@@ -134,8 +135,8 @@ class SendingChannel(object):
                 try:
                     msg = self.pending_messages.get()
                     self.pipe.send(msg)
-                except Exception, e:
-                    printmsg('%s: %s' % (e.__class__.__name__, e.message))
+                except Exception as e:
+                    printmsg('%s: %s' % (e.__class__.__name__, e.message if hasattr(e, 'message') else str(e)))
 
         feeding_thread = threading.Thread(target=feed)
         feeding_thread.setDaemon(True)
@@ -156,7 +157,7 @@ class SendingChannels(object):
     A group of one way channels for sending messages.
     """
     def __init__(self, num_channels):
-        self.pipes = [OneWayPipe() for _ in xrange(num_channels)]
+        self.pipes = [OneWayPipe() for _ in range(num_channels)]
         self.channels = [SendingChannel(p) for p in self.pipes]
         self.num_channels = num_channels
 
@@ -164,7 +165,7 @@ class SendingChannels(object):
         for ch in self.channels:
             try:
                 ch.close()
-            except:
+            except ValueError:
                 pass
 
 
@@ -173,7 +174,7 @@ class ReceivingChannels(object):
     A group of one way channels for receiving messages.
     """
     def __init__(self, num_channels):
-        self.pipes = [OneWayPipe() for _ in xrange(num_channels)]
+        self.pipes = [OneWayPipe() for _ in range(num_channels)]
         self.channels = [ReceivingChannel(p) for p in self.pipes]
         self._readers = [p.reader for p in self.pipes]
         self._rlocks = [p.rlock for p in self.pipes]
@@ -187,7 +188,13 @@ class ReceivingChannels(object):
         Implementation of the recv method for Linux, where select is available. Receive an object from
         all pipes that are ready for reading without blocking.
         """
-        readable, _, _ = select(self._readers, [], [], timeout)
+        while True:
+            try:
+                readable, _, _ = select(self._readers, [], [], timeout)
+            except OSError:
+                raise
+            else:
+                break
         for r in readable:
             with self._rlocks_by_readers[r]:
                 try:
@@ -218,7 +225,7 @@ class ReceivingChannels(object):
         for ch in self.channels:
             try:
                 ch.close()
-            except:
+            except ValueError:
                 pass
 
 
@@ -242,8 +249,7 @@ class CopyTask(object):
             DEBUG = True
 
         # do not display messages when exporting to STDOUT unless --debug is set
-        self.printmsg = printmsg if self.fname is not None or direction == 'from' or DEBUG \
-            else lambda _, eol='\n': None
+        self.printmsg = printmsg if self.fname is not None or direction == 'from' or DEBUG else None
         self.options = self.parse_options(opts, direction)
 
         self.num_processes = self.options.copy['numprocesses']
@@ -272,8 +278,8 @@ class CopyTask(object):
         if not os.path.isfile(config_file):
             return opts
 
-        configs = ConfigParser.RawConfigParser()
-        configs.readfp(open(config_file))
+        configs = configparser.RawConfigParser()
+        configs.read_file(open(config_file))
 
         ret = dict()
         config_sections = list(['copy', 'copy-%s' % (direction,),
@@ -301,8 +307,8 @@ class CopyTask(object):
         """
         Convert all option values to valid string literals unless they are path names
         """
-        return dict([(k, v.decode('string_escape') if k not in ['errfile', 'ratefile'] else v)
-                     for k, v, in opts.iteritems()])
+        return dict([(k, v if k not in ['errfile', 'ratefile'] else v)
+                     for k, v, in opts.items()])
 
     def parse_options(self, opts, direction):
         """
@@ -335,8 +341,10 @@ class CopyTask(object):
         copy_options['pagetimeout'] = int(opts.pop('pagetimeout', max(10, 10 * (copy_options['pagesize'] / 1000))))
         copy_options['maxattempts'] = int(opts.pop('maxattempts', 5))
         copy_options['dtformats'] = DateTimeFormat(opts.pop('datetimeformat', shell.display_timestamp_format),
-                                                   shell.display_date_format, shell.display_nanotime_format)
-        copy_options['float_precision'] = shell.display_float_precision
+                                                   shell.display_date_format, shell.display_nanotime_format,
+                                                   milliseconds_only=True)
+        copy_options['floatprecision'] = int(opts.pop('floatprecision', '5'))
+        copy_options['doubleprecision'] = int(opts.pop('doubleprecision', '12'))
         copy_options['chunksize'] = int(opts.pop('chunksize', 5000))
         copy_options['ingestrate'] = int(opts.pop('ingestrate', 100000))
         copy_options['maxbatchsize'] = int(opts.pop('maxbatchsize', 20))
@@ -357,13 +365,19 @@ class CopyTask(object):
         copy_options['errfile'] = safe_normpath(opts.pop('errfile', 'import_%s_%s.err' % (self.ks, self.table,)))
         copy_options['ratefile'] = safe_normpath(opts.pop('ratefile', ''))
         copy_options['maxoutputsize'] = int(opts.pop('maxoutputsize', '-1'))
-        copy_options['preparedstatements'] = bool(opts.pop('preparedstatements', 'false').lower() == 'true')
+        copy_options['preparedstatements'] = bool(opts.pop('preparedstatements', 'true').lower() == 'true')
+        copy_options['ttl'] = int(opts.pop('ttl', -1))
 
         # Hidden properties, they do not appear in the documentation but can be set in config files
         # or on the cmd line but w/o completion
         copy_options['maxinflightmessages'] = int(opts.pop('maxinflightmessages', '512'))
         copy_options['maxbackoffattempts'] = int(opts.pop('maxbackoffattempts', '12'))
         copy_options['maxpendingchunks'] = int(opts.pop('maxpendingchunks', '24'))
+        # set requesttimeout to a value high enough so that maxbatchsize rows will never timeout if the server
+        # responds: here we set it to 1 sec per 10 rows but no less than 60 seconds
+        copy_options['requesttimeout'] = int(opts.pop('requesttimeout', max(60, 1 * copy_options['maxbatchsize'] / 10)))
+        # set childtimeout higher than requesttimeout so that child processes have a chance to report request timeouts
+        copy_options['childtimeout'] = int(opts.pop('childtimeout', copy_options['requesttimeout'] + 30))
 
         self.check_options(copy_options)
         return CopyOptions(copy=copy_options, dialect=dialect_options, unrecognized=opts)
@@ -397,8 +411,11 @@ class CopyTask(object):
         """
         try:
             num_cores_for_testing = os.environ.get('CQLSH_COPY_TEST_NUM_CORES', '')
-            return int(num_cores_for_testing) if num_cores_for_testing else mp.cpu_count()
+            ret = int(num_cores_for_testing) if num_cores_for_testing else mp.cpu_count()
+            printdebugmsg("Detected %d core(s)" % (ret,))
+            return ret
         except NotImplementedError:
+            printdebugmsg("Failed to detect number of cores, returning 1")
             return 1
 
     @staticmethod
@@ -458,10 +475,8 @@ class CopyTask(object):
     def make_params(self):
         """
         Return a dictionary of parameters to be used by the worker processes.
-        On Windows this dictionary must be pickle-able, therefore we do not pass the
-        parent connection since it may not be pickle-able. Also, on Windows child
-        processes are spawned and not forked, and therefore we don't need to shutdown
-        the parent connection anyway, see CASSANDRA-11749 for more details.
+        On platforms using 'spawn' as the default multiprocessing start method,
+        this dictionary must be picklable.
         """
         shell = self.shell
 
@@ -475,11 +490,12 @@ class CopyTask(object):
                     port=shell.port,
                     ssl=shell.ssl,
                     auth_provider=shell.auth_provider,
-                    parent_cluster=shell.conn if not IS_WINDOWS else None,
                     cql_version=shell.conn.cql_version,
                     config_file=self.config_file,
                     protocol_version=self.protocol_version,
-                    debug=shell.debug
+                    debug=shell.debug,
+                    coverage=shell.coverage,
+                    coveragerc_path=shell.coveragerc_path
                     )
 
     def validate_columns(self):
@@ -519,7 +535,7 @@ class ExportWriter(object):
         self.columns = columns
         self.options = options
         self.header = options.copy['header']
-        self.max_output_size = long(options.copy['maxoutputsize'])
+        self.max_output_size = int(options.copy['maxoutputsize'])
         self.current_dest = None
         self.num_files = 0
 
@@ -540,7 +556,7 @@ class ExportWriter(object):
 
         if self.header:
             writer = csv.writer(self.current_dest.output, **self.options.dialect)
-            writer.writerow(self.columns)
+            writer.writerow([str(c) for c in self.columns])
 
         return True
 
@@ -562,10 +578,10 @@ class ExportWriter(object):
             return CsvDest(output=sys.stdout, close=False)
         else:
             try:
-                ret = CsvDest(output=open(source_name, 'wb'), close=True)
+                ret = CsvDest(output=open(source_name, 'w'), close=True)
                 self.num_files += 1
                 return ret
-            except IOError, e:
+            except IOError as e:
                 self.shell.printerr("Can't open %r for writing: %s" % (source_name, e))
                 return None
 
@@ -589,7 +605,7 @@ class ExportWriter(object):
         if (self.num_written + num) > self.max_output_size:
             num_remaining = self.max_output_size - self.num_written
             last_switch = 0
-            for i, row in enumerate(filter(None, data.split(os.linesep))):
+            for i, row in enumerate([_f for _f in data.split(os.linesep) if _f]):
                 if i == num_remaining:
                     self._next_dest()
                     last_switch = i
@@ -610,8 +626,8 @@ class ExportTask(CopyTask):
         CopyTask.__init__(self, shell, ks, table, columns, fname, opts, protocol_version, config_file, 'to')
 
         options = self.options
-        self.begin_token = long(options.copy['begintoken']) if options.copy['begintoken'] else None
-        self.end_token = long(options.copy['endtoken']) if options.copy['endtoken'] else None
+        self.begin_token = int(options.copy['begintoken']) if options.copy['begintoken'] else None
+        self.end_token = int(options.copy['endtoken']) if options.copy['endtoken'] else None
         self.writer = ExportWriter(fname, shell, columns, options)
 
     def run(self):
@@ -622,7 +638,7 @@ class ExportTask(CopyTask):
         shell = self.shell
 
         if self.options.unrecognized:
-            shell.printerr('Unrecognized COPY TO options: %s' % ', '.join(self.options.unrecognized.keys()))
+            shell.printerr('Unrecognized COPY TO options: %s' % ', '.join(list(self.options.unrecognized.keys())))
             return
 
         if not self.validate_columns():
@@ -635,11 +651,11 @@ class ExportTask(CopyTask):
         if not self.writer.open():
             return 0
 
-        columns = u"[" + u", ".join(self.columns) + u"]"
-        self.printmsg(u"\nStarting copy of %s.%s with columns %s." % (self.ks, self.table, columns), encoding=self.encoding)
+        columns = "[" + ", ".join(self.columns) + "]"
+        self.printmsg("\nStarting copy of %s.%s with columns %s." % (self.ks, self.table, columns))
 
         params = self.make_params()
-        for i in xrange(self.num_processes):
+        for i in range(self.num_processes):
             self.processes.append(ExportProcess(self.update_params(params, i)))
 
         self.start_processes()
@@ -680,15 +696,15 @@ class ExportTask(CopyTask):
             """
             ret = (prev, curr)
             if begin_token:
-                if ret[1] < begin_token:
+                if curr < begin_token:
                     return None
-                elif ret[0] < begin_token:
-                    ret = (begin_token, ret[1])
+                elif (prev is None) or (prev < begin_token):
+                    ret = (begin_token, curr)
 
             if end_token:
-                if ret[0] > end_token:
+                if (ret[0] is not None) and (ret[0] > end_token):
                     return None
-                elif ret[1] > end_token:
+                elif (curr is not None) and (curr > end_token):
                     ret = (ret[0], end_token)
 
             return ret
@@ -715,7 +731,7 @@ class ExportTask(CopyTask):
             ranges[(begin_token, end_token)] = make_range_data()
             return ranges
 
-        ring = shell.get_ring(self.ks).items()
+        ring = list(shell.get_ring(self.ks).items())
         ring.sort()
 
         if not ring:
@@ -744,6 +760,10 @@ class ExportTask(CopyTask):
 
             #  For the last ring interval we query the same replicas that hold the first token in the ring
             if previous is not None and (not end_token or previous < end_token):
+                ranges[(previous, end_token)] = first_range_data
+            # TODO: fix this logic added in 4.0: if previous is None, then it can't be compared with less than
+            elif previous is None and (not end_token or previous < end_token):
+                previous = begin_token if begin_token else min_token
                 ranges[(previous, end_token)] = first_range_data
 
         if not ranges:
@@ -794,7 +814,7 @@ class ExportTask(CopyTask):
         total_requests = len(ranges)
         max_attempts = self.options.copy['maxattempts']
 
-        self.send_work(ranges, ranges.keys())
+        self.send_work(ranges, list(ranges.keys()))
 
         num_processes = len(processes)
         succeeded = 0
@@ -853,12 +873,13 @@ class FilesReader(object):
         self.max_rows = options.copy['maxrows']
         self.skip_rows = options.copy['skiprows']
         self.fname = fname
-        self.sources = None  # must be created later due to pickle problems on Windows
+        self.sources = None  # might be initialised directly here? (see CASSANDRA-17350)
         self.num_sources = 0
         self.current_source = None
         self.num_read = 0
 
-    def get_source(self, paths):
+    @staticmethod
+    def get_source(paths):
         """
          Return a source generator. Each source is a named tuple
          wrapping the source input, file name and a boolean indicating
@@ -866,18 +887,21 @@ class FilesReader(object):
         """
         def make_source(fname):
             try:
-                return open(fname, 'rb')
-            except IOError, e:
-                printdebugmsg("Can't open %r for reading: %s" % (fname, e))
-                return None
+                return open(fname, 'r')
+            except IOError as e:
+                raise IOError("Can't open %r for reading: %s" % (fname, e))
 
         for path in paths.split(','):
             path = path.strip()
             if os.path.isfile(path):
                 yield make_source(path)
             else:
-                for f in glob.glob(path):
-                    yield (make_source(f))
+                result = glob.glob(path)
+                if len(result) == 0:
+                    raise IOError("Can't open %r for reading: no matching file found" % (path,))
+
+                for f in result:
+                    yield make_source(f)
 
     def start(self):
         self.sources = self.get_source(self.fname)
@@ -895,14 +919,14 @@ class FilesReader(object):
         self.close_current_source()
         while self.current_source is None:
             try:
-                self.current_source = self.sources.next()
+                self.current_source = next(self.sources)
                 if self.current_source:
                     self.num_sources += 1
             except StopIteration:
                 return False
 
         if self.header:
-            self.current_source.next()
+            next(self.current_source)
 
         return True
 
@@ -921,9 +945,9 @@ class FilesReader(object):
             return []
 
         rows = []
-        for i in xrange(min(max_rows, self.chunk_size)):
+        for i in range(min(max_rows, self.chunk_size)):
             try:
-                row = self.current_source.next()
+                row = next(self.current_source)
                 self.num_read += 1
 
                 if 0 <= self.max_rows < self.num_read:
@@ -937,7 +961,7 @@ class FilesReader(object):
                 self.next_source()
                 break
 
-        return filter(None, rows)
+        return [_f for _f in rows if _f]
 
 
 class PipeReader(object):
@@ -959,7 +983,7 @@ class PipeReader(object):
 
     def read_rows(self, max_rows):
         rows = []
-        for i in xrange(min(max_rows, self.chunk_size)):
+        for i in range(min(max_rows, self.chunk_size)):
             row = self.inpipe.recv()
             if row is None:
                 self.exhausted = True
@@ -1071,11 +1095,11 @@ class ImportErrorHandler(object):
             shell.printerr("Failed to import %d rows: %s - %s,  given up without retries"
                            % (len(err.rows), err.name, err.msg))
         else:
-            self.insert_errors += len(err.rows)
             if not err.final:
                 shell.printerr("Failed to import %d rows: %s - %s,  will retry later, attempt %d of %d"
                                % (len(err.rows), err.name, err.msg, err.attempts, self.max_attempts))
             else:
+                self.insert_errors += len(err.rows)
                 self.add_failed_rows(err.rows)
                 shell.printerr("Failed to import %d rows: %s - %s,  given up after %d attempts"
                                % (len(err.rows), err.name, err.msg, err.attempts))
@@ -1125,14 +1149,14 @@ class ImportTask(CopyTask):
         shell = self.shell
 
         if self.options.unrecognized:
-            shell.printerr('Unrecognized COPY FROM options: %s' % ', '.join(self.options.unrecognized.keys()))
+            shell.printerr('Unrecognized COPY FROM options: %s' % ', '.join(list(self.options.unrecognized.keys())))
             return
 
         if not self.validate_columns():
             return 0
 
-        columns = u"[" + u", ".join(self.valid_columns) + u"]"
-        self.printmsg(u"\nStarting copy of %s.%s with columns %s." % (self.ks, self.table, columns), encoding=self.encoding)
+        columns = "[" + ", ".join(self.valid_columns) + "]"
+        self.printmsg("\nStarting copy of %s.%s with columns %s." % (self.ks, self.table, columns))
 
         try:
             params = self.make_params()
@@ -1141,8 +1165,7 @@ class ImportTask(CopyTask):
                 self.processes.append(ImportProcess(self.update_params(params, i)))
 
             feeder = FeedingProcess(self.outmsg.pipes[-1], self.inmsg.pipes[-1],
-                                    self.outmsg.pipes[:-1], self.fname, self.options,
-                                    self.shell.conn if not IS_WINDOWS else None)
+                                    self.outmsg.pipes[:-1], self.fname, self.options)
             self.processes.append(feeder)
 
             self.start_processes()
@@ -1154,8 +1177,8 @@ class ImportTask(CopyTask):
             if pr:
                 profile_off(pr, file_name='parent_profile_%d.txt' % (os.getpid(),))
 
-        except Exception, exc:
-            shell.printerr(unicode(exc))
+        except Exception as exc:
+            shell.printerr(str(exc))
             if shell.debug:
                 traceback.print_exc()
             return 0
@@ -1177,7 +1200,7 @@ class ImportTask(CopyTask):
 
         self.outmsg.channels[-1].send(None)
         if shell.tty:
-            print
+            print()
 
     def import_records(self):
         """
@@ -1188,8 +1211,20 @@ class ImportTask(CopyTask):
         if not self.fname:
             self.send_stdin_rows()
 
+        child_timeout = self.options.copy['childtimeout']
+        last_recv_num_records = 0
+        last_recv_time = time.time()
+
         while self.feeding_result is None or self.receive_meter.total_records < self.feeding_result.sent:
             self.receive_results()
+
+            if self.feeding_result is not None:
+                if self.receive_meter.total_records != last_recv_num_records:
+                    last_recv_num_records = self.receive_meter.total_records
+                    last_recv_time = time.time()
+                elif (time.time() - last_recv_time) > child_timeout:
+                    self.shell.printerr("No records inserted in {} seconds, aborting".format(child_timeout))
+                    break
 
             if self.error_handler.max_exceeded() or not self.all_processes_running():
                 break
@@ -1217,7 +1252,7 @@ class ImportTask(CopyTask):
             attempts -= 1
 
         self.printmsg("\n%d rows imported from %d files in %s (%d skipped)." %
-                      (self.receive_meter.get_total_records(),
+                      (self.receive_meter.get_total_records() - self.error_handler.num_rows_failed,
                        self.feeding_result.num_sources if self.feeding_result else 0,
                        self.describe_interval(time.time() - self.time_start),
                        self.feeding_result.skip_rows if self.feeding_result else 0))
@@ -1249,21 +1284,20 @@ class FeedingProcess(mp.Process):
     """
     A process that reads from import sources and sends chunks to worker processes.
     """
-    def __init__(self, inpipe, outpipe, worker_pipes, fname, options, parent_cluster):
-        mp.Process.__init__(self, target=self.run)
+    def __init__(self, inpipe, outpipe, worker_pipes, fname, options):
+        super(FeedingProcess, self).__init__(target=self.run)
         self.inpipe = inpipe
         self.outpipe = outpipe
         self.worker_pipes = worker_pipes
-        self.inmsg = None  # must be created after forking on Windows
-        self.outmsg = None  # must be created after forking on Windows
-        self.worker_channels = None  # must be created after forking on Windows
+        self.inmsg = None  # might be initialised directly here? (see CASSANDRA-17350)
+        self.outmsg = None  # might be initialised directly here? (see CASSANDRA-17350)
+        self.worker_channels = None  # might be initialised directly here? (see CASSANDRA-17350)
         self.reader = FilesReader(fname, options) if fname else PipeReader(inpipe, options)
         self.send_meter = RateMeter(log_fcn=None, update_interval=1)
         self.ingest_rate = options.copy['ingestrate']
         self.num_worker_processes = options.copy['numprocesses']
         self.max_pending_chunks = options.copy['maxpendingchunks']
         self.chunk_id = 0
-        self.parent_cluster = parent_cluster
 
     def on_fork(self):
         """
@@ -1273,10 +1307,6 @@ class FeedingProcess(mp.Process):
         self.inmsg = ReceivingChannel(self.inpipe)
         self.outmsg = SendingChannel(self.outpipe)
         self.worker_channels = [SendingChannel(p) for p in self.worker_pipes]
-
-        if self.parent_cluster:
-            printdebugmsg("Closing parent cluster sockets")
-            self.parent_cluster.shutdown()
 
     def run(self):
         pr = profile_on() if PROFILE_ON else None
@@ -1297,14 +1327,19 @@ class FeedingProcess(mp.Process):
         self.on_fork()
 
         reader = self.reader
-        reader.start()
+        try:
+            reader.start()
+        except IOError as exc:
+            self.outmsg.send(
+                ImportTaskError(exc.__class__.__name__, exc.message if hasattr(exc, 'message') else str(exc)))
+
         channels = self.worker_channels
         max_pending_chunks = self.max_pending_chunks
         sent = 0
         failed_attempts = 0
 
         while not reader.exhausted:
-            channels_eligible = filter(lambda c: c.num_pending() < max_pending_chunks, channels)
+            channels_eligible = [c for c in channels if c.num_pending() < max_pending_chunks]
             if not channels_eligible:
                 failed_attempts += 1
                 delay = randint(1, pow(2, failed_attempts))
@@ -1324,8 +1359,9 @@ class FeedingProcess(mp.Process):
                     rows = reader.read_rows(max_rows)
                     if rows:
                         sent += self.send_chunk(ch, rows)
-                except Exception, exc:
-                    self.outmsg.send(ImportTaskError(exc.__class__.__name__, exc.message))
+                except Exception as exc:
+                    self.outmsg.send(
+                        ImportTaskError(exc.__class__.__name__, exc.message if hasattr(exc, 'message') else str(exc)))
 
                 if reader.exhausted:
                     break
@@ -1358,11 +1394,11 @@ class ChildProcess(mp.Process):
     """
 
     def __init__(self, params, target):
-        mp.Process.__init__(self, target=target)
+        super(ChildProcess, self).__init__(target=target)
         self.inpipe = params['inpipe']
         self.outpipe = params['outpipe']
-        self.inmsg = None  # must be initialized after fork on Windows
-        self.outmsg = None  # must be initialized after fork on Windows
+        self.inmsg = None  # might be initialised directly here? (see CASSANDRA-17350)
+        self.outmsg = None  # might be initialised directly here? (see CASSANDRA-17350)
         self.ks = params['ks']
         self.table = params['table']
         self.local_dc = params['local_dc']
@@ -1373,7 +1409,6 @@ class ChildProcess(mp.Process):
         self.connect_timeout = params['connect_timeout']
         self.cql_version = params['cql_version']
         self.auth_provider = params['auth_provider']
-        self.parent_cluster = params['parent_cluster']
         self.ssl = params['ssl']
         self.protocol_version = params['protocol_version']
         self.config_file = params['config_file']
@@ -1391,6 +1426,12 @@ class ChildProcess(mp.Process):
             self.test_failures = json.loads(os.environ.get('CQLSH_COPY_TEST_FAILURES', ''))
         else:
             self.test_failures = None
+        # attributes for coverage
+        self.coverage = params['coverage']
+        self.coveragerc_path = params['coveragerc_path']
+        self.coverage_collection = None
+        self.sigterm_handler = None
+        self.sighup_handler = None
 
     def on_fork(self):
         """
@@ -1399,14 +1440,35 @@ class ChildProcess(mp.Process):
         self.inmsg = ReceivingChannel(self.inpipe)
         self.outmsg = SendingChannel(self.outpipe)
 
-        if self.parent_cluster:
-            printdebugmsg("Closing parent cluster sockets")
-            self.parent_cluster.shutdown()
-
     def close(self):
         printdebugmsg("Closing queues...")
         self.inmsg.close()
         self.outmsg.close()
+
+    def start_coverage(self):
+        import coverage
+        self.coverage_collection = coverage.Coverage(config_file=self.coveragerc_path)
+        self.coverage_collection.start()
+
+        # save current handlers for SIGTERM and SIGHUP
+        self.sigterm_handler = signal.getsignal(signal.SIGTERM)
+        self.sighup_handler = signal.getsignal(signal.SIGTERM)
+
+        def handle_sigterm():
+            self.stop_coverage()
+            self.close()
+            self.terminate()
+
+        # set custom handler for SIGHUP and SIGTERM
+        # needed to make sure coverage data is saved
+        signal.signal(signal.SIGTERM, handle_sigterm)
+        signal.signal(signal.SIGHUP, handle_sigterm)
+
+    def stop_coverage(self):
+        self.coverage_collection.stop()
+        self.coverage_collection.save()
+        signal.signal(signal.SIGTERM, self.sigterm_handler)
+        signal.signal(signal.SIGHUP, self.sighup_handler)
 
 
 class ExpBackoffRetryPolicy(RetryPolicy):
@@ -1503,7 +1565,8 @@ class ExportProcess(ChildProcess):
     def __init__(self, params):
         ChildProcess.__init__(self, params=params, target=self.run)
         options = params['options']
-        self.float_precision = options.copy['float_precision']
+        self.float_precision = options.copy['floatprecision']
+        self.double_precision = options.copy['doubleprecision']
         self.nullval = options.copy['nullval']
         self.max_requests = options.copy['maxrequests']
 
@@ -1512,9 +1575,13 @@ class ExportProcess(ChildProcess):
         self.options = options
 
     def run(self):
+        if self.coverage:
+            self.start_coverage()
         try:
             self.inner_run()
         finally:
+            if self.coverage:
+                self.stop_coverage()
             self.close()
 
     def inner_run(self):
@@ -1547,7 +1614,7 @@ class ExportProcess(ChildProcess):
             if print_traceback and sys.exc_info()[1] == err:
                 traceback.print_exc()
         else:
-            msg = unicode(err)
+            msg = str(err)
         return msg
 
     def report_error(self, err, token_range):
@@ -1571,7 +1638,7 @@ class ExportProcess(ChildProcess):
             self.attach_callbacks(token_range, future, session)
 
     def num_requests(self):
-        return sum(session.num_requests() for session in self.hosts_to_sessions.values())
+        return sum(session.num_requests() for session in list(self.hosts_to_sessions.values()))
 
     def get_session(self, hosts, token_range):
         """
@@ -1591,7 +1658,7 @@ class ExportProcess(ChildProcess):
         for host in hosts:
             try:
                 ret = self.connect(host)
-            except Exception, e:
+            except Exception as e:
                 errors.append(self.get_error_message(e))
 
             if ret:
@@ -1604,7 +1671,7 @@ class ExportProcess(ChildProcess):
         return None
 
     def connect(self, host):
-        if host in self.hosts_to_sessions.keys():
+        if host in list(self.hosts_to_sessions.keys()):
             session = self.hosts_to_sessions[host]
             session.add_request()
             return session
@@ -1627,12 +1694,17 @@ class ExportProcess(ChildProcess):
         return session
 
     def attach_callbacks(self, token_range, future, session):
+        metadata = session.cluster.metadata
+        ks_meta = metadata.keyspaces[self.ks]
+        table_meta = ks_meta.tables[self.table]
+        cql_types = [CqlType(table_meta.columns[c].cql_type, ks_meta) for c in self.columns]
+
         def result_callback(rows):
             if future.has_more_pages:
                 future.start_fetching_next_page()
-                self.write_rows_to_csv(token_range, rows)
+                self.write_rows_to_csv(token_range, rows, cql_types)
             else:
-                self.write_rows_to_csv(token_range, rows)
+                self.write_rows_to_csv(token_range, rows, cql_types)
                 self.send((None, None))
                 session.complete_request()
 
@@ -1642,7 +1714,7 @@ class ExportProcess(ChildProcess):
 
         future.add_callbacks(callback=result_callback, errback=err_callback)
 
-    def write_rows_to_csv(self, token_range, rows):
+    def write_rows_to_csv(self, token_range, rows, cql_types):
         if not rows:
             return  # no rows in this range
 
@@ -1651,33 +1723,37 @@ class ExportProcess(ChildProcess):
             writer = csv.writer(output, **self.options.dialect)
 
             for row in rows:
-                writer.writerow(map(self.format_value, row))
+                writer.writerow(list(map(self.format_value, row, cql_types)))
 
             data = (output.getvalue(), len(rows))
             self.send((token_range, data))
             output.close()
 
-        except Exception, e:
+        except Exception as e:
             self.report_error(e, token_range)
 
-    def format_value(self, val):
+    def format_value(self, val, cqltype):
         if val is None or val == EMPTY:
             return format_value_default(self.nullval, colormap=NO_COLOR_MAP)
 
-        ctype = type(val)
-        formatter = self.formatters.get(ctype, None)
+        formatter = self.formatters.get(cqltype, None)
         if not formatter:
-            formatter = get_formatter(ctype)
-            self.formatters[ctype] = formatter
+            formatter = get_formatter(val, cqltype)
+            self.formatters[cqltype] = formatter
 
-        return formatter(val, encoding=self.encoding, colormap=NO_COLOR_MAP, date_time_format=self.date_time_format,
-                         float_precision=self.float_precision, nullval=self.nullval, quote=False,
-                         decimal_sep=self.decimal_sep, thousands_sep=self.thousands_sep,
-                         boolean_styles=self.boolean_styles)
+        if not hasattr(cqltype, 'precision'):
+            cqltype.precision = self.double_precision if cqltype.type_name == 'double' else self.float_precision
+
+        formatted = formatter(val, cqltype=cqltype,
+                              encoding=self.encoding, colormap=NO_COLOR_MAP, date_time_format=self.date_time_format,
+                              float_precision=cqltype.precision, nullval=self.nullval, quote=False,
+                              decimal_sep=self.decimal_sep, thousands_sep=self.thousands_sep,
+                              boolean_styles=self.boolean_styles)
+        return formatted
 
     def close(self):
         ChildProcess.close(self)
-        for session in self.hosts_to_sessions.values():
+        for session in list(self.hosts_to_sessions.values()):
             session.shutdown()
 
     def prepare_query(self, partition_key, token_range, attempts):
@@ -1739,6 +1815,22 @@ class ParseError(Exception):
     pass
 
 
+class ImmutableDict(frozenset):
+    """
+    Immutable dictionary implementation to represent map types.
+    We need to pass BoundStatement.bind() a dict() because it calls iteritems(),
+    except we can't create a dict with another dict as the key, hence we use a class
+    that adds iteritems to a frozen set of tuples (which is how dict are normally made
+    immutable in python).
+    Must be declared in the top level of the module to be available for pickling.
+    """
+    iteritems = frozenset.__iter__
+
+    def items(self):
+        for k, v in self.iteritems():
+            yield k, v
+
+
 class ImportConversion(object):
     """
     A class for converting strings to values when importing from csv, used by ImportProcess,
@@ -1762,33 +1854,16 @@ class ImportConversion(object):
 
         if statement is None:
             self.use_prepared_statements = False
+            statement = self._get_primary_key_statement(parent, table_meta)
         else:
             self.use_prepared_statements = True
 
         self.is_counter = parent.is_counter(table_meta)
-        self.proto_version = parent.session.cluster.protocol_version
-
-        self.typename_to_class_map = {
-            'bigint': LongType,
-            'boolean': BooleanType,
-            'decimal': DecimalType,
-            'double': DoubleType,
-            'float': FloatType,
-            'inet': InetAddressType,
-            'int': Int32Type,
-            'smallint': ShortType,
-            'text': VarcharType,
-            'time': TimeType,
-            'timestamp': TimestampType,
-            'timeuuid': TimeUUIDType,
-            'uuid': UUIDType,
-            'varchar': VarcharType,
-            'varint': IntegerType
-        }
+        self.proto_version = statement.protocol_version
 
         # the cql types and converters for the prepared statement, either the full statement or only the primary keys
-        self.cqltypes = [self.typename_to_class_map[c.cql_type] for c in table_meta.partition_key]
-        self.converters = [self._get_converter(c) for c in self.cqltypes]
+        self.cqltypes = [c.type for c in statement.column_metadata]
+        self.converters = [self._get_converter(c.type) for c in statement.column_metadata]
 
         # the cql types for the entire statement, these are the same as the types above but
         # only when using prepared statements
@@ -1796,9 +1871,10 @@ class ImportConversion(object):
         # these functions are used for non-prepared statements to protect values with quotes if required
         self.protectors = [self._get_protector(t) for t in self.coltypes]
 
-    def _get_protector(self, t):
+    @staticmethod
+    def _get_protector(t):
         if t in ('ascii', 'text', 'timestamp', 'date', 'time', 'inet'):
-            return lambda v: unicode(protect_value(v), self.encoding)
+            return lambda v: protect_value(v)
         else:
             return lambda v: v
 
@@ -1815,15 +1891,18 @@ class ImportConversion(object):
                                                          where_clause)
         return parent.session.prepare(select_query)
 
+    @staticmethod
+    def unprotect(v):
+        if v is not None:
+            return CqlRuleSet.dequote_value(v)
+
     def _get_converter(self, cql_type):
         """
         Return a function that converts a string into a value the can be passed
         into BoundStatement.bind() for the given cql type. See cassandra.cqltypes
         for more details.
         """
-        def unprotect(v):
-            if v is not None:
-                return CqlRuleSet.dequote_value(v)
+        unprotect = self.unprotect
 
         def convert(t, v):
             v = unprotect(v)
@@ -1833,16 +1912,20 @@ class ImportConversion(object):
 
         def convert_mandatory(t, v):
             v = unprotect(v)
-            if v == self.nullval:
+            # we can't distinguish between empty strings and null values in csv. Null values are not supported in
+            # collections, so it must be an empty string.
+            if v == self.nullval and not issubclass(t, VarcharType):
                 raise ParseError('Empty values are not allowed')
             return converters.get(t.typename, convert_unknown)(v, ct=t)
 
         def convert_blob(v, **_):
-            return bytearray.fromhex(v[2:])
+            if sys.version_info.major >= 3:
+                return bytes.fromhex(v[2:])
+            else:
+                return BlobType(v[2:].decode("hex"))
 
         def convert_text(v, **_):
-            v = v.decode('string_escape')
-            return v
+            return str(v)
 
         def convert_uuid(v, **_):
             return UUID(v)
@@ -1863,22 +1946,44 @@ class ImportConversion(object):
             """
             Return a slow and a fast decimal conversion function depending on self.thousands_sep and self.decimal_sep
             """
+            empty_str = ''
+            dot_str = '.'
             if self.thousands_sep and self.decimal_sep:
-                return lambda v, ct=cql_type: adapter(v.replace(self.thousands_sep, '').replace(self.decimal_sep, '.'))
+                return lambda v, ct=cql_type: \
+                    adapter(v.replace(self.thousands_sep, empty_str).replace(self.decimal_sep, dot_str))
             elif self.thousands_sep:
-                return lambda v, ct=cql_type: adapter(v.replace(self.thousands_sep, ''))
+                return lambda v, ct=cql_type: adapter(v.replace(self.thousands_sep, empty_str))
             elif self.decimal_sep:
-                return lambda v, ct=cql_type: adapter(v.replace(self.decimal_sep, '.'))
+                return lambda v, ct=cql_type: adapter(v.replace(self.decimal_sep, dot_str))
             else:
                 return lambda v, ct=cql_type: adapter(v)
 
         def split(val, sep=','):
             """
-            Split into a list of values whenever we encounter a separator but
+            Split "val" into a list of values whenever the separator "sep" is found, but
             ignore separators inside parentheses or single quotes, except for the two
-            outermost parentheses, which will be ignored. We expect val to be at least
-            2 characters long (the two outer parentheses).
+            outermost parentheses, which will be ignored. This method is called when parsing composite
+            types, "val" should be at least 2 characters long, the first char should be an
+            open parenthesis and the last char should be a matching closing parenthesis. We could also
+            check exactly which parenthesis type depending on the caller, but I don't want to enforce
+            too many checks that don't necessarily provide any additional benefits, and risk breaking
+            data that could previously be imported, even if strictly speaking it is incorrect CQL.
+            For example, right now we accept sets that start with '[' and ']', I don't want to break this
+            by enforcing '{' and '}' in a minor release.
             """
+            def is_open_paren(cc):
+                return cc == '{' or cc == '[' or cc == '('
+
+            def is_close_paren(cc):
+                return cc == '}' or cc == ']' or cc == ')'
+
+            def paren_match(c1, c2):
+                return (c1 == '{' and c2 == '}') or (c1 == '[' and c2 == ']') or (c1 == '(' and c2 == ')')
+
+            if len(val) < 2 or not paren_match(val[0], val[-1]):
+                raise ParseError('Invalid composite string, it should start and end with matching parentheses: {}'
+                                 .format(val))
+
             ret = []
             last = 1
             level = 0
@@ -1887,9 +1992,9 @@ class ImportConversion(object):
                 if c == '\'':
                     quote = not quote
                 elif not quote:
-                    if c == '{' or c == '[' or c == '(':
+                    if is_open_paren(c):
                         level += 1
-                    elif c == '}' or c == ']' or c == ')':
+                    elif is_close_paren(c):
                         level -= 1
                     elif c == sep and level == 1:
                         ret.append(val[last:i])
@@ -1900,15 +2005,15 @@ class ImportConversion(object):
 
             return ret
 
-        # this should match all possible CQL datetime formats
-        p = re.compile("(\d{4})\-(\d{2})\-(\d{2})\s?(?:'T')?" +  # YYYY-MM-DD[( |'T')]
-                       "(?:(\d{2}):(\d{2})(?::(\d{2}))?)?" +  # [HH:MM[:SS]]
-                       "(?:([+\-])(\d{2}):?(\d{2}))?")  # [(+|-)HH[:]MM]]
+        # this should match all possible CQL and CQLSH datetime formats
+        p = re.compile(r"(\d{4})-(\d{2})-(\d{2})\s?(?:'T')?"  # YYYY-MM-DD[( |'T')]
+                       + r"(?:(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?))?"  # [HH:MM[:SS[.NNNNNN]]]
+                       + r"(?:([+\-])(\d{2}):?(\d{2}))?")  # [(+|-)HH[:]MM]]
 
         def convert_datetime(val, **_):
             try:
-                tval = time.strptime(val, self.date_time_format)
-                return timegm(tval) * 1e3  # scale seconds to millis for the raw value
+                dtval = datetime.datetime.strptime(val, self.date_time_format)
+                return dtval.timestamp() * 1000
             except ValueError:
                 pass  # if it's not in the default format we try CQL formats
 
@@ -1922,20 +2027,23 @@ class ImportConversion(object):
                     raise ValueError("can't interpret %r as a date with format %s or as int" % (val,
                                                                                                 self.date_time_format))
 
-            # https://docs.python.org/2/library/time.html#time.struct_time
+            # https://docs.python.org/3/library/time.html#time.struct_time
             tval = time.struct_time((int(m.group(1)), int(m.group(2)), int(m.group(3)),  # year, month, day
                                     int(m.group(4)) if m.group(4) else 0,  # hour
                                     int(m.group(5)) if m.group(5) else 0,  # minute
                                     int(m.group(6)) if m.group(6) else 0,  # second
                                     0, 1, -1))  # day of week, day of year, dst-flag
 
-            if m.group(7):
-                offset = (int(m.group(8)) * 3600 + int(m.group(9)) * 60) * int(m.group(7) + '1')
+            # convert sub-seconds (a number between 1 and 6 digits) to milliseconds
+            milliseconds = 0 if not m.group(7) else int(m.group(7)) * pow(10, 3 - len(m.group(7)))
+
+            if m.group(8):
+                offset = (int(m.group(9)) * 3600 + int(m.group(10)) * 60) * int(m.group(8) + '1')
             else:
                 offset = -time.timezone
 
             # scale seconds to millis for the raw value
-            return (timegm(tval) + offset) * 1e3
+            return ((timegm(tval) + offset) * 1000) + milliseconds
 
         def convert_date(v, **_):
             return Date(v)
@@ -1947,23 +2055,19 @@ class ImportConversion(object):
             return tuple(convert_mandatory(t, v) for t, v in zip(ct.subtypes, split(val)))
 
         def convert_list(val, ct=cql_type):
-            return list(convert_mandatory(ct.subtypes[0], v) for v in split(val))
+            return tuple(convert_mandatory(ct.subtypes[0], v) for v in split(val))
 
         def convert_set(val, ct=cql_type):
             return frozenset(convert_mandatory(ct.subtypes[0], v) for v in split(val))
 
         def convert_map(val, ct=cql_type):
             """
-            We need to pass to BoundStatement.bind() a dict() because it calls iteritems(),
-            except we can't create a dict with another dict as the key, hence we use a class
-            that adds iteritems to a frozen set of tuples (which is how dict are normally made
-            immutable in python).
+            See ImmutableDict above for a discussion of why a special object is needed here.
             """
-            class ImmutableDict(frozenset):
-                iteritems = frozenset.__iter__
-
+            split_format_str = '{%s}'
+            sep = ':'
             return ImmutableDict(frozenset((convert_mandatory(ct.subtypes[0], v[0]), convert(ct.subtypes[1], v[1]))
-                                 for v in [split('{%s}' % vv, sep=':') for vv in split(val)]))
+                                 for v in [split(split_format_str % vv, sep=sep) for vv in split(val)]))
 
         def convert_user_type(val, ct=cql_type):
             """
@@ -1971,10 +2075,17 @@ class ImportConversion(object):
             an attribute, so we are using named tuples. It must also be hashable,
             so we cannot use dictionaries. Maybe there is a way to instantiate ct
             directly but I could not work it out.
+            Also note that it is possible that the subfield names in the csv are in the
+            wrong order, so we must sort them according to ct.fieldnames, see CASSANDRA-12959.
             """
-            vals = [v for v in [split('{%s}' % vv, sep=':') for vv in split(val)]]
-            ret_type = namedtuple(ct.typename, [unprotect(v[0]) for v in vals])
-            return ret_type(*tuple(convert(t, v[1]) for t, v in zip(ct.subtypes, vals)))
+            split_format_str = '{%s}'
+            sep = ':'
+            vals = [v for v in [split(split_format_str % vv, sep=sep) for vv in split(val)]]
+            dict_vals = dict((unprotect(v[0]), v[1]) for v in vals)
+            sorted_converted_vals = [(n, convert(t, dict_vals[n]) if n in dict_vals else self.get_null_val())
+                                     for n, t in zip(ct.fieldnames, ct.subtypes)]
+            ret_type = namedtuple(ct.typename, [v[0] for v in sorted_converted_vals])
+            return ret_type(*tuple(v[1] for v in sorted_converted_vals))
 
         def convert_single_subtype(val, ct=cql_type):
             return converters.get(ct.subtypes[0].typename, convert_unknown)(val, ct=ct.subtypes[0])
@@ -1997,11 +2108,11 @@ class ImportConversion(object):
             'ascii': convert_text,
             'float': get_convert_decimal_fcn(),
             'double': get_convert_decimal_fcn(),
-            'bigint': get_convert_integer_fcn(adapter=long),
+            'bigint': get_convert_integer_fcn(adapter=int),
             'int': get_convert_integer_fcn(),
             'varint': get_convert_integer_fcn(),
             'inet': convert_text,
-            'counter': get_convert_integer_fcn(adapter=long),
+            'counter': get_convert_integer_fcn(adapter=int),
             'timestamp': convert_datetime,
             'timeuuid': convert_uuid,
             'date': convert_date,
@@ -2046,10 +2157,17 @@ class ImportConversion(object):
         def convert(c, v):
             try:
                 return c(v) if v != self.nullval else self.get_null_val()
-            except Exception, e:
+            except Exception as e:
+                # if we could not convert an empty string, then self.nullval has been set to a marker
+                # because the user needs to import empty strings, except that the converters for some types
+                # will fail to convert an empty string, in this case the null value should be inserted
+                # see CASSANDRA-12794
+                if v == '':
+                    return self.get_null_val()
+
                 if self.debug:
                     traceback.print_exc()
-                raise ParseError("Failed to parse %s : %s" % (val, e.message))
+                raise ParseError("Failed to parse %s : %s" % (v, e.message if hasattr(e, 'message') else str(e)))
 
         return [convert(conv, val) for conv, val in zip(converters, row)]
 
@@ -2072,7 +2190,7 @@ class ImportConversion(object):
             return self.cqltypes[n].serialize(v, self.proto_version)
 
         def serialize_value_not_prepared(n, v):
-            return self.cqltypes[n].serialize(self.converters[n](v), self.proto_version)
+            return self.cqltypes[n].serialize(self.converters[n](self.unprotect(v)), self.proto_version)
 
         partition_key_indexes = self.partition_key_indexes
         serialize = serialize_value_prepared if self.use_prepared_statements else serialize_value_not_prepared
@@ -2084,8 +2202,9 @@ class ImportConversion(object):
             pk_values = []
             for i in partition_key_indexes:
                 val = serialize(i, row[i])
-                l = len(val)
-                pk_values.append(struct.pack(">H%dsB" % l, l, val, 0))
+                length = len(val)
+                pk_values.append(struct.pack(">H%dsB" % length, length, val, 0))
+
             return b"".join(pk_values)
 
         if len(partition_key_indexes) == 1:
@@ -2141,7 +2260,7 @@ class TokenMap(object):
 
     def filter_replicas(self, hosts):
         shuffled = tuple(sorted(hosts, key=lambda k: random.random()))
-        return filter(lambda r: r.is_up is not False and r.datacenter == self.local_dc, shuffled) if hosts else ()
+        return [r for r in shuffled if r.is_up is not False and r.datacenter == self.local_dc] if hosts else ()
 
 
 class FastTokenAwarePolicy(DCAwareRoundRobinPolicy):
@@ -2174,7 +2293,7 @@ class FastTokenAwarePolicy(DCAwareRoundRobinPolicy):
                     return conn.in_flight < min(conn.max_request_id, self.max_inflight_messages)
                 return True
 
-            for i in xrange(self.max_backoff_attempts):
+            for i in range(self.max_backoff_attempts):
                 for r in filter(replica_is_not_overloaded, replicas):
                     yield r
 
@@ -2206,7 +2325,7 @@ class ImportProcess(ChildProcess):
         ChildProcess.__init__(self, params=params, target=self.run)
 
         self.skip_columns = params['skip_columns']
-        self.valid_columns = params['valid_columns']
+        self.valid_columns = [c for c in params['valid_columns']]
         self.skip_column_indexes = [i for i, c in enumerate(self.columns) if c in self.skip_columns]
 
         options = params['options']
@@ -2215,8 +2334,10 @@ class ImportProcess(ChildProcess):
         self.min_batch_size = options.copy['minbatchsize']
         self.max_batch_size = options.copy['maxbatchsize']
         self.use_prepared_statements = options.copy['preparedstatements']
+        self.ttl = options.copy['ttl']
         self.max_inflight_messages = options.copy['maxinflightmessages']
         self.max_backoff_attempts = options.copy['maxbackoffattempts']
+        self.request_timeout = options.copy['requesttimeout']
 
         self.dialect_options = options.dialect
         self._session = None
@@ -2243,10 +2364,13 @@ class ImportProcess(ChildProcess):
                 connection_class=ConnectionWrapper)
 
             self._session = cluster.connect(self.ks)
-            self._session.default_timeout = None
+            self._session.default_timeout = self.request_timeout
         return self._session
 
     def run(self):
+        if self.coverage:
+            self.start_coverage()
+
         try:
             pr = profile_on() if PROFILE_ON else None
 
@@ -2256,10 +2380,12 @@ class ImportProcess(ChildProcess):
             if pr:
                 profile_off(pr, file_name='worker_profile_%d.txt' % (os.getpid(),))
 
-        except Exception, exc:
+        except Exception as exc:
             self.report_error(exc)
 
         finally:
+            if self.coverage:
+                self.stop_coverage()
             self.close()
 
     def close(self):
@@ -2283,7 +2409,8 @@ class ImportProcess(ChildProcess):
                                                             protect_name(self.table),
                                                             ', '.join(protect_names(self.valid_columns),),
                                                             ', '.join(['?' for _ in self.valid_columns]))
-
+            if self.ttl >= 0:
+                query += 'USING TTL %s' % (self.ttl,)
             query = self.session.prepare(query)
             query.consistency_level = self.consistency_level
             prepared_statement = query
@@ -2292,6 +2419,8 @@ class ImportProcess(ChildProcess):
             query = 'INSERT INTO %s.%s (%s) VALUES (%%s)' % (protect_name(self.ks),
                                                              protect_name(self.table),
                                                              ', '.join(protect_names(self.valid_columns),))
+            if self.ttl >= 0:
+                query += 'USING TTL %s' % (self.ttl,)
             make_statement = self.wrap_make_statement(self.make_non_prepared_batch_statement)
 
         conv = ImportConversion(self, table_meta, prepared_statement)
@@ -2326,47 +2455,46 @@ class ImportProcess(ChildProcess):
                         future = session.execute_async(statement)
                         future.add_callbacks(callback=result_callback, callback_args=(batch, chunk),
                                              errback=err_callback, errback_args=(batch, chunk, replicas))
+                    # do not handle else case, if a statement could not be created, the exception is handled
+                    # in self.wrap_make_statement and the error is reported, if a failure is injected that
+                    # causes the statement to be None, then we should not report the error so that we can test
+                    # the parent process handling missing batches from child processes
 
-            except Exception, exc:
+            except Exception as exc:
                 self.report_error(exc, chunk, chunk['rows'])
 
     def wrap_make_statement(self, inner_make_statement):
         def make_statement(query, conv, chunk, batch, replicas):
             try:
                 return inner_make_statement(query, conv, batch, replicas)
-            except Exception, exc:
-                print "Failed to make batch statement: {}".format(exc)
+            except Exception as exc:
+                print("Failed to make batch statement: {}".format(exc))
                 self.report_error(exc, chunk, batch['rows'])
                 return None
 
         def make_statement_with_failures(query, conv, chunk, batch, replicas):
-            failed_batch = self.maybe_inject_failures(batch)
-            if failed_batch:
+            failed_batch, apply_failure = self.maybe_inject_failures(batch)
+            if apply_failure:
                 return failed_batch
             return make_statement(query, conv, chunk, batch, replicas)
 
         return make_statement_with_failures if self.test_failures else make_statement
 
     def make_counter_batch_statement(self, query, conv, batch, replicas):
-        def make_full_query(r):
-            where_clause = []
-            set_clause = []
-            for i, value in enumerate(r):
-                if i in conv.primary_key_indexes:
-                    where_clause.append("%s=%s" % (self.valid_columns[i], value))
-                else:
-                    set_clause.append("%s=%s+%s" % (self.valid_columns[i], self.valid_columns[i], value))
-            return query % (','.join(set_clause), ' AND '.join(where_clause))
-
-        if len(batch['rows']) == 1:
-            statement = SimpleStatement(make_full_query(batch['rows'][0]), consistency_level=self.consistency_level)
-        else:
-            statement = BatchStatement(batch_type=BatchType.COUNTER, consistency_level=self.consistency_level)
-            for row in batch['rows']:
-                statement.add(make_full_query(row))
-
+        statement = BatchStatement(batch_type=BatchType.COUNTER, consistency_level=self.consistency_level)
         statement.replicas = replicas
         statement.keyspace = self.ks
+        for row in batch['rows']:
+            where_clause = []
+            set_clause = []
+            for i, value in enumerate(row):
+                if i in conv.primary_key_indexes:
+                    where_clause.append("{}={}".format(self.valid_columns[i], str(value)))
+                else:
+                    set_clause.append("{}={}+{}".format(self.valid_columns[i], self.valid_columns[i], str(value)))
+
+            full_query_text = query % (','.join(set_clause), ' AND '.join(where_clause))
+            statement.add(full_query_text)
         return statement
 
     def make_prepared_batch_statement(self, query, _, batch, replicas):
@@ -2380,25 +2508,18 @@ class ImportProcess(ChildProcess):
         We could optimize further by removing bound_statements altogether but we'd have to duplicate much
         more driver's code (BoundStatement.bind()).
         """
-        if len(batch['rows']) == 1:
-            statement = query.bind(batch['rows'][0])
-        else:
-            statement = BatchStatement(batch_type=BatchType.UNLOGGED, consistency_level=self.consistency_level)
-            statement._statements_and_parameters = [(True, query.query_id, query.bind(r).values) for r in batch['rows']]
-
+        statement = BatchStatement(batch_type=BatchType.UNLOGGED, consistency_level=self.consistency_level)
         statement.replicas = replicas
         statement.keyspace = self.ks
+        statement._statements_and_parameters = [(True, query.query_id, query.bind(r).values) for r in batch['rows']]
         return statement
 
     def make_non_prepared_batch_statement(self, query, _, batch, replicas):
-        if len(batch['rows']) == 1:
-            statement = SimpleStatement(query % (','.join(batch['rows'][0]),), consistency_level=self.consistency_level)
-        else:
-            statement = BatchStatement(batch_type=BatchType.UNLOGGED, consistency_level=self.consistency_level)
-            statement._statements_and_parameters = [(False, query % (','.join(r),), ()) for r in batch['rows']]
-
+        statement = BatchStatement(batch_type=BatchType.UNLOGGED, consistency_level=self.consistency_level)
         statement.replicas = replicas
         statement.keyspace = self.ks
+        field_sep = ','
+        statement._statements_and_parameters = [(False, query % (field_sep.join(r),), ()) for r in batch['rows']]
         return statement
 
     def convert_rows(self, conv, chunk):
@@ -2418,23 +2539,25 @@ class ImportProcess(ChildProcess):
         def convert_row(r):
             try:
                 return conv.convert_row(r)
-            except Exception, err:
-                errors[err.message].append(r)
+            except Exception as err:
+                errors[err.message if hasattr(err, 'message') else str(err)].append(r)
                 return None
 
-        converted_rows = filter(None, [convert_row(r) for r in rows])
+        converted_rows = [_f for _f in [convert_row(r) for r in rows] if _f]
 
         if errors:
-            for msg, rows in errors.iteritems():
+            for msg, rows in errors.items():
                 self.report_error(ParseError(msg), chunk, rows)
         return converted_rows
 
     def maybe_inject_failures(self, batch):
         """
-        Examine self.test_failures and see if token_range is either a token range
-        supposed to cause a failure (failing_range) or to terminate the worker process
-        (exit_range). If not then call prepare_export_query(), which implements the
-        normal behavior.
+        Examine self.test_failures and see if the batch is a batch
+        supposed to cause a failure (failing_batch), or to terminate the worker process
+        (exit_batch), or not to be sent (unsent_batch).
+
+        @return any statement that will cause a failure or None if the statement should not be sent
+        plus a boolean indicating if a failure should be applied at all
         """
         if 'failing_batch' in self.test_failures:
             failing_batch = self.test_failures['failing_batch']
@@ -2442,14 +2565,19 @@ class ImportProcess(ChildProcess):
                 if batch['attempts'] < failing_batch['failures']:
                     statement = SimpleStatement("INSERT INTO badtable (a, b) VALUES (1, 2)",
                                                 consistency_level=self.consistency_level)
-                    return statement
+                    return statement, True  # use this statement, which will cause an error
 
         if 'exit_batch' in self.test_failures:
             exit_batch = self.test_failures['exit_batch']
             if exit_batch['id'] == batch['id']:
                 sys.exit(1)
 
-        return None  # carry on as normal
+        if 'unsent_batch' in self.test_failures:
+            unsent_batch = self.test_failures['unsent_batch']
+            if unsent_batch['id'] == batch['id']:
+                return None, True  # do not send this batch, which will cause missing acks in the parent process
+
+        return None, False  # carry on as normal, do not apply any failures
 
     @staticmethod
     def make_batch(batch_id, rows, attempts=1):
@@ -2483,33 +2611,36 @@ class ImportProcess(ChildProcess):
             try:
                 pk = get_row_partition_key_values(row)
                 rows_by_ring_pos[get_ring_pos(ring, pk_to_token_value(pk))].append(row)
-            except Exception, e:
-                errors[e.message].append(row)
+            except Exception as e:
+                errors[e.message if hasattr(e, 'message') else str(e)].append(row)
 
         if errors:
-            for msg, rows in errors.iteritems():
+            for msg, rows in errors.items():
                 self.report_error(ParseError(msg), chunk, rows)
 
         replicas = tm.replicas
         filter_replicas = tm.filter_replicas
         rows_by_replica = defaultdict(list)
-        for ring_pos, rows in rows_by_ring_pos.iteritems():
+        for ring_pos, rows in rows_by_ring_pos.items():
             if len(rows) > min_batch_size:
-                for i in xrange(0, len(rows), max_batch_size):
+                for i in range(0, len(rows), max_batch_size):
                     yield filter_replicas(replicas[ring_pos]), make_batch(chunk['id'], rows[i:i + max_batch_size])
             else:
                 # select only the first valid replica to guarantee more overlap or none at all
-                rows_by_replica[filter_replicas(replicas[ring_pos])[:1]].extend(rows)
+                # TODO: revisit tuple wrapper
+                rows_by_replica[tuple(filter_replicas(replicas[ring_pos])[:1])].extend(rows)
 
         # Now send the batches by replica
-        for replicas, rows in rows_by_replica.iteritems():
-            for i in xrange(0, len(rows), max_batch_size):
+        for replicas, rows in rows_by_replica.items():
+            for i in range(0, len(rows), max_batch_size):
                 yield replicas, make_batch(chunk['id'], rows[i:i + max_batch_size])
 
     def result_callback(self, _, batch, chunk):
         self.update_chunk(batch['rows'], chunk)
 
     def err_callback(self, response, batch, chunk, replicas):
+        if isinstance(response, OperationTimedOut) and chunk['imported'] == chunk['num_rows_sent']:
+            return  # occasionally the driver sends false timeouts for rows already processed (PYTHON-652)
         err_is_final = batch['attempts'] >= self.max_attempts
         self.report_error(response, chunk, batch['rows'], batch['attempts'], err_is_final)
         if not err_is_final:
@@ -2519,10 +2650,12 @@ class ImportProcess(ChildProcess):
             future.add_callbacks(callback=self.result_callback, callback_args=(batch, chunk),
                                  errback=self.err_callback, errback_args=(batch, chunk, replicas))
 
+    # TODO: review why this is defined twice
     def report_error(self, err, chunk=None, rows=None, attempts=1, final=True):
         if self.debug and sys.exc_info()[1] == err:
             traceback.print_exc()
-        self.outmsg.send(ImportTaskError(err.__class__.__name__, err.message, rows, attempts, final))
+        err_msg = err.message if hasattr(err, 'message') else str(err)
+        self.outmsg.send(ImportTaskError(err.__class__.__name__, err_msg, rows, attempts, final))
         if final and chunk is not None:
             self.update_chunk(rows, chunk)
 

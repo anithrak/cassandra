@@ -1,3 +1,11 @@
+cassandra (3.0.9-rubrik-23.0) unstable; urgency=medium
+  * Fix deps
+
+ -- Mohan Raghu Garimella <mohan.garimella@rubrik.com>  Thu, 26 Sep 2024 15:56:17 -0700
+cassandra (3.0.9-rubrik-22.0) unstable; urgency=medium
+  * Make cqlsh python3 compatible
+
+ -- Mohan Raghu Garimella <mohan.garimella@rubrik.com>  Thu, 26 Sep 2024 15:56:17 -0700
 cassandra (3.0.9-rubrik-21.0) unstable; urgency=medium
   * Remove unnecessary files for Rubrik CDM 
 
