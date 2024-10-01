@@ -17,11 +17,30 @@
 # to configure behavior, define $CQL_TEST_HOST to the destination address
 # for Thrift connections, and $CQL_TEST_PORT to the associated port.
 
+import os
+import sys
+from glob import glob
 from unittest import TestCase
 from operator import itemgetter
 
-from ..cql3handling import CqlRuleSet
 
+CQL_LIB_PREFIX = 'cassandra-driver-internal-only-'
+CASSANDRA_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), '../../..')
+ZIPLIB_DIRS = [os.path.join(CASSANDRA_PATH, 'lib')]
+def find_zip(libprefix):
+    for ziplibdir in ZIPLIB_DIRS:
+        zips = glob(os.path.join(ziplibdir, libprefix + '*.zip'))
+        if zips:
+            return max(zips)  # probably the highest version, if multiple
+
+
+cql_zip = find_zip(CQL_LIB_PREFIX)
+if cql_zip:
+    ver = os.path.splitext(os.path.basename(cql_zip))[0][len(CQL_LIB_PREFIX):]
+    sys.path.insert(0, os.path.join(cql_zip, 'cassandra-driver-' + ver))
+    sys.path.insert(0, os.path.join(CASSANDRA_PATH, 'pylib'))
+
+from cqlshlib.cql3handling import CqlRuleSet
 
 class TestCqlParsing(TestCase):
     def test_parse_string_literals(self):

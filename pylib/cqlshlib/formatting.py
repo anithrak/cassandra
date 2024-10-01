@@ -20,13 +20,16 @@ import math
 import re
 import sys
 import platform
-import wcwidth
+
+from six import ensure_text
+
+from . import wcwidth
 
 from collections import defaultdict
-from displaying import colorme, get_str, FormattedValue, DEFAULT_VALUE_COLORS, NO_COLOR_MAP
+from .displaying import colorme, get_str, FormattedValue, DEFAULT_VALUE_COLORS, NO_COLOR_MAP
 from cassandra.cqltypes import EMPTY
 from cassandra.util import datetime_from_timestamp
-from util import UTC
+from .util import UTC
 
 is_win = platform.system() == 'Windows'
 
@@ -41,6 +44,7 @@ def _show_control_chars(match):
     else:
         txt = txt[1:-1]
     return txt
+
 
 bits_to_turn_red_re = re.compile(r'\\([^uUx]|u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|U[0-9a-fA-F]{8})')
 
@@ -116,7 +120,7 @@ class DateTimeFormat():
 
 
 def format_value_default(val, colormap, **_):
-    val = str(val)
+    val = ensure_text(str(val))
     escapedval = val.replace('\\', '\\\\')
     bval = controlchars_re.sub(_show_control_chars, escapedval)
     return bval if colormap is NO_COLOR_MAP else color_text(bval, colormap)
@@ -144,15 +148,27 @@ def formatter_for(typname):
     return registrator
 
 
-@formatter_for('bytearray')
+class BlobType:
+    def __init__(self, val):
+        self.val = val
+
+    def __str__(self):
+        return str(self.val)
+
+
+@formatter_for('BlobType')
 def format_value_blob(val, colormap, **_):
-    bval = '0x' + binascii.hexlify(val)
+    bval = ensure_text('0x') + ensure_text(binascii.hexlify(val))
     return colorme(bval, colormap, 'blob')
+
+
+formatter_for('bytearray')(format_value_blob)
 formatter_for('buffer')(format_value_blob)
+formatter_for('blob')(format_value_blob)
 
 
 def format_python_formatted_type(val, colormap, color, quote=False):
-    bval = str(val)
+    bval = ensure_text(str(val))
     if quote:
         bval = "'%s'" % bval
     return colorme(bval, colormap, color)
@@ -214,6 +230,7 @@ formatter_for('float')(format_floating_point_type)
 def format_integer_type(val, colormap, thousands_sep=None, **_):
     # base-10 only for now; support others?
     bval = format_integer_with_thousands_sep(val, thousands_sep) if thousands_sep else str(val)
+    bval = ensure_text(bval)
     return colorme(bval, colormap, 'int')
 
 # We can get rid of this in cassandra-2.2
@@ -261,18 +278,20 @@ def format_value_time(val, colormap, **_):
 
 @formatter_for('str')
 def format_value_text(val, encoding, colormap, quote=False, **_):
-    escapedval = val.replace(u'\\', u'\\\\')
+    escapedval = val.replace('\\', '\\\\')
     if quote:
         escapedval = escapedval.replace("'", "''")
     escapedval = unicode_controlchars_re.sub(_show_control_chars, escapedval)
-    bval = escapedval.encode(encoding, 'backslashreplace')
+    bval = escapedval
     if quote:
-        bval = "'%s'" % bval
+        bval = "'{}'".format(bval)
+    return bval if colormap is NO_COLOR_MAP else color_text(bval, colormap, wcwidth.wcswidth(bval))
 
-    return bval if colormap is NO_COLOR_MAP else color_text(bval, colormap, wcwidth.wcswidth(bval.decode(encoding)))
 
 # name alias
 formatter_for('unicode')(format_value_text)
+formatter_for('text')(format_value_text)
+formatter_for('ascii')(format_value_text)
 
 
 def format_simple_collection(val, lbracket, rbracket, encoding,
@@ -313,7 +332,7 @@ def format_value_tuple(val, encoding, colormap, date_time_format, float_precisio
 @formatter_for('set')
 def format_value_set(val, encoding, colormap, date_time_format, float_precision, nullval,
                      decimal_sep, thousands_sep, boolean_styles, **_):
-    return format_simple_collection(sorted(val), '{', '}', encoding, colormap,
+    return format_simple_collection(val, '{', '}', encoding, colormap,
                                     date_time_format, float_precision, nullval,
                                     decimal_sep, thousands_sep, boolean_styles)
 formatter_for('frozenset')(format_value_set)
@@ -360,7 +379,7 @@ def format_value_utype(val, encoding, colormap, date_time_format, float_precisio
     def format_field_name(name):
         return format_value_text(name, encoding=encoding, colormap=colormap, quote=False)
 
-    subs = [(format_field_name(k), format_field_value(v)) for (k, v) in val._asdict().items()]
+    subs = [(format_field_name(k), format_field_value(v)) for (k, v) in list(val._asdict().items())]
     bval = '{' + ', '.join(get_str(k) + ': ' + get_str(v) for (k, v) in subs) + '}'
     if colormap is NO_COLOR_MAP:
         return bval

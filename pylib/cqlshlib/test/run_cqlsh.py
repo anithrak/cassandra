@@ -32,13 +32,13 @@ def is_win():
     return sys.platform in ("cygwin", "win32")
 
 if is_win():
-    from winpty import WinPty
+    from .winpty import WinPty
     DEFAULT_PREFIX = ''
 else:
     import pty
     DEFAULT_PREFIX = os.linesep
 
-DEFAULT_CQLSH_PROMPT = DEFAULT_PREFIX + '(\S+@)?cqlsh(:\S+)?> '
+DEFAULT_CQLSH_PROMPT = DEFAULT_PREFIX + r'(\S+@)?cqlsh(:\S+)?> '
 DEFAULT_CQLSH_TERM = 'xterm'
 
 cqlshlog = basecase.cqlshlog
@@ -103,7 +103,7 @@ def timing_out_alarm(seconds):
 if is_win():
     try:
         import eventlet
-    except ImportError, e:
+    except ImportError as e:
         sys.exit("evenlet library required to run cqlshlib tests on Windows")
 
     def timing_out(seconds):
@@ -171,13 +171,18 @@ class ProcRunner:
         return self.proc.wait()
 
     def send_tty(self, data):
+        if not isinstance(data, bytes):
+            data = data.encode("utf-8")
         os.write(self.childpty, data)
 
     def send_pipe(self, data):
         self.proc.stdin.write(data)
 
     def read_tty(self, blksize, timeout=None):
-        return os.read(self.childpty, blksize)
+        buf = os.read(self.childpty, blksize)
+        if isinstance(buf, bytes):
+            buf = buf.decode("utf-8")
+        return buf
 
     def read_pipe(self, blksize, timeout=None):
         return self.proc.stdout.read(blksize)
@@ -187,16 +192,18 @@ class ProcRunner:
 
     def read_until(self, until, blksize=4096, timeout=None,
                    flags=0, ptty_timeout=None):
-        if not isinstance(until, re._pattern_type):
+        if not isinstance(until, re.Pattern):
             until = re.compile(until, flags)
         got = self.readbuf
         self.readbuf = ''
         with timing_out(timeout):
             while True:
                 val = self.read(blksize, ptty_timeout)
+                print("val : ", val)
                 cqlshlog.debug("read %r from subproc" % (val,))
                 if val == '':
                     raise EOFError("'until' pattern %r not found" % (until.pattern,))
+
                 got += val
                 m = until.search(got)
                 if m is not None:
@@ -260,6 +267,7 @@ class CqlshRunner(ProcRunner):
             args += ('--encoding', 'utf-8')
             if win_force_colors:
                 args += ('--color',)
+        # print('keyspace : ', keyspace)
         self.keyspace = keyspace
         ProcRunner.__init__(self, path, tty=tty, args=args, env=env, **kwargs)
         self.prompt = prompt
@@ -305,6 +313,8 @@ def call_cqlsh(**kwargs):
     proginput = kwargs.pop('input', '')
     kwargs['tty'] = False
     c = CqlshRunner(**kwargs)
-    output, _ = c.proc.communicate(proginput)
+    output, _ = c.proc.communicate(proginput.encode())
     result = c.close()
+    if isinstance(output, bytes):
+        output = output.decode("utf-8")
     return output, result

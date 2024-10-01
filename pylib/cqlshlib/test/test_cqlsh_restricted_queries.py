@@ -18,9 +18,18 @@ import os
 from .basecase import BaseTestCase
 from .cassconnect import testrun_cqlsh
 from .ansi_colors import ColoredText
+from .cassconnect import create_db, remove_db
 import sys
 
 class TestCqlshRestrictedQueries(BaseTestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        create_db()
+
+    @classmethod
+    def tearDownClass(cls):
+        remove_db()
 
     def test_restricted_query_blocked(self):
         envs = [
@@ -33,12 +42,13 @@ class TestCqlshRestrictedQueries(BaseTestCase):
                 for table in table_names:
                     restricted_query_templates = [
                         'insert into {0} (id) values ("g");',
-                        'update {0} set id = "g";',
-                        'delete from {0};',
-                        'consistency all; delete from {0};'
+                        'update {0} set id = "g" where id="g";',
+                        'delete from {0} where id="g";',
+                        'consistency all; delete from {0} where id="g";'
                     ]
                     allowed_query_templates = [
                         'select * from {0};'
+                        'desc keyspaces;'
                     ]
                     restricted_queries = [
                         t.format(table) for t in restricted_query_templates]

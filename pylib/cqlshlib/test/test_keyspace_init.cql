@@ -259,39 +259,6 @@ values (
         }
     });
 
-CREATE FUNCTION fBestband ( input double )
-    RETURNS NULL ON NULL INPUT
-    RETURNS text 
-    LANGUAGE java
-    AS 'return "Iron Maiden";';
-
-CREATE FUNCTION fBestsong ( input double )
-    RETURNS NULL ON NULL INPUT
-    RETURNS text 
-    LANGUAGE java
-    AS 'return "Revelations";';
-
-CREATE FUNCTION fMax(current int, candidate int)
-    CALLED ON NULL INPUT
-    RETURNS int 
-    LANGUAGE java 
-    AS 'if (current == null) return candidate; else return Math.max(current, candidate);' ;
-
-CREATE FUNCTION fMin(current int, candidate int)
-    CALLED ON NULL INPUT
-    RETURNS int
-    LANGUAGE java 
-    AS 'if (current == null) return candidate; else return Math.min(current, candidate);' ;
-
-CREATE AGGREGATE aggMax(int)
-    SFUNC fMax
-    STYPE int
-    INITCOND null;
-
-CREATE AGGREGATE aggMin(int)
-    SFUNC fMin
-    STYPE int
-    INITCOND null;
 
 -- Create blobstore specific tables to test query restriction
 -- Queries that mutate data in these tables are to be prohibited
