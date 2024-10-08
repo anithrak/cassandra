@@ -28,7 +28,7 @@ build-stamp: patch-stamp
 	printf "version=%s" $(VERSION) > build.properties
 
 	cd pylib && python3 setup.py install --no-compile --install-layout deb \
-		--root $(CURDIR)/debian/cassandra
+		--root $(CURDIR)/debian/rubrik-cqlsh
 
 	touch build-stamp
 
