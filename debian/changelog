@@ -1,3 +1,7 @@
+rubrik-cqlsh (3.0.9-rubrik-25.0) unstable; urgency=medium
+  * Make COPY command py3 compatible
+
+ -- Shubham Tagra <shubham.tagra@rubrik.com>  Fri Dec 30 10:26:06 2024 +0530
 rubrik-cqlsh (3.0.9-rubrik-24.0) unstable; urgency=medium
   * Fix desc
 
