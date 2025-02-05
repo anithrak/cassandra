@@ -1,7 +1,11 @@
+rubrik-cqlsh (3.0.9-rubrik-26.0) unstable; urgency=medium
+  * Suppress `DeprecationWarning` coming from cassandra python driver
+
+ -- Lalit Gupta <lalit.gupta@rubrik.com>  Wed, 05 Feb 2025 12:06:00 -0800
 rubrik-cqlsh (3.0.9-rubrik-25.0) unstable; urgency=medium
   * Make COPY command py3 compatible
 
- -- Shubham Tagra <shubham.tagra@rubrik.com>  Fri Dec 30 10:26:06 2024 +0530
+ -- Shubham Tagra <shubham.tagra@rubrik.com>  Fri, Dec 30 2024 10:26:06 +0530
 rubrik-cqlsh (3.0.9-rubrik-24.0) unstable; urgency=medium
   * Fix desc
 
